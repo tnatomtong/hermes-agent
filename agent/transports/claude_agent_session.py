@@ -188,7 +188,9 @@ def check_claude_cli(claude_bin: str = "claude") -> tuple[bool, Optional[str]]:
     return True, raw or "unknown version"
 
 
-def _build_hermes_tools_mcp_config() -> dict[str, Any]:
+def _build_hermes_tools_mcp_config(
+    env_extra: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
     """Stdio MCP config that gives the Claude Code subprocess Hermes' tools
     (web_search, browser_*, vision, skills, kanban_*, and so on).
 
@@ -196,7 +198,12 @@ def _build_hermes_tools_mcp_config() -> dict[str, Any]:
     is the same server the codex runtime registers in ~/.codex/config.toml.
     Here the SDK passes it per session via ClaudeAgentOptions.mcp_servers, so
     nothing is written to disk. The env passthrough matches
-    codex_runtime_plugin_migration._build_hermes_tools_mcp_entry()."""
+    codex_runtime_plugin_migration._build_hermes_tools_mcp_entry().
+
+    env_extra adds session-specific values the runtime glue knows but this
+    module does not, for example the gateway flag that turns on the cron tool
+    and the session origin (platform, chat id) so cron jobs post back to the
+    right chat."""
     env: dict[str, str] = {
         "HERMES_QUIET": "1",
         "HERMES_REDACT_SECRETS": os.environ.get("HERMES_REDACT_SECRETS", "true"),
@@ -212,6 +219,8 @@ def _build_hermes_tools_mcp_config() -> dict[str, Any]:
     kanban_task = os.environ.get("HERMES_KANBAN_TASK")
     if kanban_task:
         env["HERMES_KANBAN_TASK"] = kanban_task
+    if env_extra:
+        env.update({k: v for k, v in env_extra.items() if v})
     return {
         "type": "stdio",
         "command": sys.executable,
@@ -237,6 +246,9 @@ class ClaudeAgentSession:
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[Any], None]] = None,
         expose_hermes_tools: bool = True,
+        system_prompt_append: Optional[str] = None,
+        disallowed_tools: Optional[list[str]] = None,
+        mcp_env_extra: Optional[dict[str, str]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -251,6 +263,17 @@ class ClaudeAgentSession:
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook, same slot as the codex adapter
         self._expose_hermes_tools = expose_hermes_tools
+        # Text added to Claude Code's own system prompt (its preset is kept).
+        # This is how the session learns it is running as Hermes. The content
+        # is built by the runtime glue, not here, so this file stays free of
+        # Hermes-specific text.
+        self._system_prompt_append = system_prompt_append
+        # Claude Code built-in tools to turn off, for example its own cron and
+        # routine tools that clash with Hermes' cron.
+        self._disallowed_tools = disallowed_tools
+        # Extra env for the hermes-tools MCP subprocess (gateway flag, session
+        # origin). Built by the runtime glue, which has the session context.
+        self._mcp_env_extra = mcp_env_extra
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -298,8 +321,10 @@ class ClaudeAgentSession:
     async def _async_start(self) -> None:
         mcp_servers: dict[str, Any] = {}
         if self._expose_hermes_tools:
-            mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config()
-        options = ClaudeAgentOptions(
+            mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config(
+                self._mcp_env_extra
+            )
+        opts: dict[str, Any] = dict(
             cwd=self._cwd,
             model=self._model,
             permission_mode=self._permission_mode,
@@ -308,6 +333,18 @@ class ClaudeAgentSession:
             cli_path=self._claude_bin,
             stderr=self._collect_stderr,
         )
+        # Keep Claude Code's own system prompt (the preset) and add the Hermes
+        # context on top. With no append we leave system_prompt unset so the
+        # default is used as is.
+        if self._system_prompt_append:
+            opts["system_prompt"] = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": self._system_prompt_append,
+            }
+        if self._disallowed_tools:
+            opts["disallowed_tools"] = list(self._disallowed_tools)
+        options = ClaudeAgentOptions(**opts)
         client = ClaudeSDKClient(options=options)
         await client.connect()
         self._client = client

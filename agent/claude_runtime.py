@@ -28,6 +28,119 @@ logger = logging.getLogger(__name__)
 _CLAUDE_MODEL_ALIASES = {"sonnet", "opus", "haiku"}
 
 
+# Claude Code's own scheduling tools. They make Claude Code routines, which are
+# separate from Hermes cron. We turn them off so the model uses Hermes' cron
+# instead of silently creating a routine that does nothing for the user. This
+# is the bug we saw: asked about cron, the model reached for these.
+_DISALLOWED_CLAUDE_TOOLS = (
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "RemoteTrigger",
+)
+
+
+# Runtime note added on top of Hermes' own identity. It explains the one thing
+# the model cannot work out on its own: that it is the engine behind Hermes,
+# and how this runtime is wired. It is kept to principles, not a tool list, so
+# it does not go stale when Hermes adds or renames tools (the real tool list is
+# self-documenting through the hermes-tools MCP server).
+_RUNTIME_BRIDGE_NOTE = """\
+How this runtime works:
+- You are Claude Code, running as the engine behind Hermes. The user talks to \
+you through Hermes, usually from a chat app (Discord, Telegram, and so on), \
+not from a terminal. Present yourself as Hermes, using the identity above.
+- You keep all your own tools. You also have Hermes' own tools through an MCP \
+server named "hermes-tools" (their names start with mcp__hermes-tools__). Use \
+those for Hermes features.
+- Hermes runs its own cron jobs through the hermes-tools cron tool. Use that \
+to list, add, or change scheduled jobs. Do not use your own Cron, Routine, \
+scheduled-task tools or scheduling skills (like /schedule): those make Claude \
+Code routines, which are separate from Hermes and will not do what the user \
+wants.
+- A few Hermes features (delegate_task, Hermes memory, session search) are not \
+available on this runtime. If the user asks for one, say so plainly instead of \
+guessing."""
+
+
+def _build_runtime_context(agent) -> str:
+    """Build the text added to Claude Code's system prompt so the session knows
+    it is running as Hermes.
+
+    Reuses Hermes' own identity (SOUL.md or the default identity) and platform
+    hint so this stays in sync with Hermes. Only the runtime note is written
+    here, because it describes this runtime, which Hermes itself does not.
+    """
+    parts: list[str] = []
+
+    # 1. Hermes identity. Same source the normal runtime uses.
+    soul = None
+    try:
+        import run_agent
+
+        soul = run_agent.load_soul_md()
+    except Exception:
+        soul = None
+    if soul:
+        parts.append(soul)
+    else:
+        try:
+            from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+
+            parts.append(DEFAULT_AGENT_IDENTITY)
+        except Exception:
+            pass
+
+    # 2. Platform hint (how the user reaches the agent). Reused from Hermes.
+    platform_key = (getattr(agent, "platform", "") or "").lower().strip()
+    if platform_key:
+        try:
+            from agent.prompt_builder import PLATFORM_HINTS
+
+            if platform_key in PLATFORM_HINTS:
+                parts.append(PLATFORM_HINTS[platform_key])
+        except Exception:
+            pass
+
+    # 3. Runtime note. Written here because it is specific to this runtime.
+    parts.append(_RUNTIME_BRIDGE_NOTE)
+
+    return "\n\n".join(p for p in parts if p)
+
+
+# Session env keys that carry the chat origin. We read them once when the
+# session is created (a Hermes session maps to one chat, so they are stable
+# for its lifetime) and pass them to the MCP subprocess, so cron jobs created
+# from chat post their results back to the right place.
+_ORIGIN_ENV_KEYS = (
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_CHAT_NAME",
+    "HERMES_SESSION_THREAD_ID",
+)
+
+
+def _build_mcp_env_extra() -> dict[str, str]:
+    """Extra env for the hermes-tools MCP subprocess.
+
+    Sets HERMES_GATEWAY_SESSION so the cron tool is available (the cron toolset
+    needs a gateway or interactive flag to turn on), and forwards the chat
+    origin so cron jobs deliver back to the originating chat. Origin is read
+    through gateway.session_context, which falls back to os.environ outside a
+    gateway, so this is safe in CLI and cron contexts too."""
+    extra: dict[str, str] = {"HERMES_GATEWAY_SESSION": "1"}
+    try:
+        from gateway.session_context import get_session_env
+
+        for key in _ORIGIN_ENV_KEYS:
+            value = get_session_env(key, "")
+            if value:
+                extra[key] = str(value)
+    except Exception:
+        logger.debug("could not read session origin for cron", exc_info=True)
+    return extra
+
+
 def _claude_model_for(model: Any) -> str | None:
     name = str(model or "").strip().lower()
     if not name:
@@ -208,6 +321,9 @@ def run_claude_agent_turn(
             cwd=cwd,
             model=_claude_model_for(getattr(agent, "model", None)),
             approval_callback=approval_callback,
+            system_prompt_append=_build_runtime_context(agent),
+            disallowed_tools=list(_DISALLOWED_CLAUDE_TOOLS),
+            mcp_env_extra=_build_mcp_env_extra(),
         )
 
     # NOTE: the user message is already added to messages by the standard

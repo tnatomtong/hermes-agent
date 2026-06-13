@@ -44,6 +44,7 @@ Spawned by: CodexAppServerSession.ensure_started() when the runtime is
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -51,6 +52,61 @@ import sys
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# Map JSON Schema types to Python types so FastMCP can build a real input
+# schema from Hermes' tool definitions. Anything not listed becomes Any.
+_JSON_TO_PY: dict[str, Any] = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "object": dict,
+    "array": list,
+}
+
+
+def _signature_from_schema(schema: dict) -> Optional[inspect.Signature]:
+    """Build a function signature from a JSON Schema's properties.
+
+    The dispatch closure is written as ``_dispatch(**kwargs)``, which makes
+    FastMCP advertise a single ``kwargs`` parameter instead of the tool's real
+    parameters. The model then wraps its arguments in a ``kwargs`` field and
+    the tool never sees them. Setting ``__signature__`` with the real
+    parameter names (and types) fixes this for every exposed tool. Returns
+    None when the schema has no usable properties, so the caller keeps the
+    open ``**kwargs`` form.
+    """
+    props = (schema or {}).get("properties")
+    if not isinstance(props, dict) or not props:
+        return None
+    required = set((schema or {}).get("required") or [])
+    req_params: list[inspect.Parameter] = []
+    opt_params: list[inspect.Parameter] = []
+    for pname, pspec in props.items():
+        if not isinstance(pname, str) or not pname.isidentifier():
+            # A property we cannot turn into a clean parameter. Give up and
+            # keep the open form rather than build a half-broken signature.
+            return None
+        py_type = _JSON_TO_PY.get((pspec or {}).get("type"), Any)
+        if pname in required:
+            req_params.append(
+                inspect.Parameter(
+                    pname,
+                    inspect.Parameter.KEYWORD_ONLY,
+                    annotation=py_type,
+                )
+            )
+        else:
+            opt_params.append(
+                inspect.Parameter(
+                    pname,
+                    inspect.Parameter.KEYWORD_ONLY,
+                    default=None,
+                    annotation=(Optional[py_type] if py_type is not Any else Any),
+                )
+            )
+    return inspect.Signature(req_params + opt_params)
 
 
 # Tools we expose. Each name MUST match a registered Hermes tool that
@@ -102,6 +158,13 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_create",
     "kanban_unblock",
     "kanban_link",
+    # Hermes cron. Claude Code has no Hermes cron of its own (only its own
+    # routines, which are separate), so the model needs this to manage Hermes
+    # scheduled jobs from chat. The tool only registers when the cron toolset's
+    # requirement passes, which needs a gateway or interactive env flag. The
+    # claude_agent runtime sets that flag in its MCP env; the codex runtime
+    # does not, so this is a no-op there until they opt in the same way.
+    "cronjob",
 )
 
 
@@ -156,32 +219,34 @@ def _build_server() -> Any:
 
         # FastMCP wants a Python callable. Build a closure that takes the
         # arguments dict, dispatches via handle_function_call, and returns
-        # the result string. We use add_tool() for full control over the
-        # input schema (FastMCP's @tool() decorator inspects type hints,
-        # which we can't get from a JSON schema at runtime).
-        def _make_handler(tool_name: str):
+        # the result string. We set the closure's __signature__ from Hermes'
+        # own parameter schema so FastMCP advertises the real parameters (not
+        # a single opaque kwargs field). None values are dropped: they are
+        # optional parameters the model left out.
+        def _make_handler(tool_name: str, tool_schema: dict):
             def _dispatch(**kwargs: Any) -> str:
+                args = {k: v for k, v in (kwargs or {}).items() if v is not None}
                 try:
-                    return handle_function_call(tool_name, kwargs or {})
+                    return handle_function_call(tool_name, args)
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})
             _dispatch.__name__ = tool_name
             _dispatch.__doc__ = description
+            sig = _signature_from_schema(tool_schema)
+            if sig is not None:
+                _dispatch.__signature__ = sig
             return _dispatch
 
         try:
             mcp.add_tool(
-                _make_handler(name),
+                _make_handler(name, params_schema),
                 name=name,
                 description=description,
-                # FastMCP accepts JSON schema directly via the
-                # input_schema parameter on newer versions; older
-                # versions use parameters_schema. Try both for compat.
             )
         except TypeError:
-            # Older mcp SDK signature — fall back to decorator-style.
-            handler = _make_handler(name)
+            # Older mcp SDK signature: fall back to decorator-style.
+            handler = _make_handler(name, params_schema)
             handler = mcp.tool(name=name, description=description)(handler)
 
         exposed_count += 1
