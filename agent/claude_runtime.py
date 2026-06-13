@@ -141,6 +141,63 @@ def _build_mcp_env_extra() -> dict[str, str]:
     return extra
 
 
+def _is_truthy(value: Any) -> bool:
+    return value is True or str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _runtime_surface(config: dict) -> dict[str, Any]:
+    """Decide how much of the user's personal Claude Code setup the session
+    inherits.
+
+    Default is a predictable surface: only the MCP servers Hermes passes
+    (strict_mcp_config=True), and only project settings, so the user's global
+    Claude Code skills (like /schedule) do not bleed in. This keeps behavior the
+    same for every user instead of depending on whatever is in their ~/.claude.
+
+    Set model.claude_runtime_inherit_user_config: true to inherit the user's own
+    MCP servers and skills, for users who want that."""
+    model_cfg = (config or {}).get("model") or {}
+    if _is_truthy(model_cfg.get("claude_runtime_inherit_user_config")):
+        return {"strict_mcp_config": False, "setting_sources": ["user", "project"]}
+    return {"strict_mcp_config": True, "setting_sources": ["project"]}
+
+
+def _hermes_mcp_servers_for_sdk(config: dict) -> dict[str, Any]:
+    """Translate Hermes' own configured MCP servers (config.yaml mcp_servers)
+    into the claude-agent-sdk format, so they work on this runtime the same way
+    they work on the default runtime. This is the consistent way for a user to
+    add an MCP server (like Gmail) that works on every runtime, instead of
+    relying on it being in their personal ~/.claude. Mirrors what the codex
+    runtime migrates into ~/.codex/config.toml. Skips servers with no command
+    or url, and ones marked enabled: false."""
+    servers = (config or {}).get("mcp_servers")
+    if not isinstance(servers, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict) or cfg.get("enabled") is False:
+            continue
+        command = cfg.get("command")
+        url = cfg.get("url")
+        if command:
+            entry: dict[str, Any] = {"type": "stdio", "command": str(command)}
+            args = cfg.get("args") or []
+            if args:
+                entry["args"] = [str(a) for a in args]
+            env = cfg.get("env") or {}
+            if env:
+                entry["env"] = {str(k): str(v) for k, v in env.items()}
+            out[str(name)] = entry
+        elif url:
+            transport = "sse" if cfg.get("transport") == "sse" else "http"
+            entry = {"type": transport, "url": str(url)}
+            headers = cfg.get("headers") or {}
+            if headers:
+                entry["headers"] = {str(k): str(v) for k, v in headers.items()}
+            out[str(name)] = entry
+    return out
+
+
 def _claude_model_for(model: Any) -> str | None:
     name = str(model or "").strip().lower()
     if not name:
@@ -317,6 +374,12 @@ def run_claude_agent_turn(
             approval_callback = _get_approval_callback()
         except Exception:
             approval_callback = None
+        try:
+            from hermes_cli.config import load_config
+            config = load_config()
+        except Exception:
+            config = {}
+        surface = _runtime_surface(config)
         agent._claude_session = ClaudeAgentSession(
             cwd=cwd,
             model=_claude_model_for(getattr(agent, "model", None)),
@@ -324,6 +387,9 @@ def run_claude_agent_turn(
             system_prompt_append=_build_runtime_context(agent),
             disallowed_tools=list(_DISALLOWED_CLAUDE_TOOLS),
             mcp_env_extra=_build_mcp_env_extra(),
+            extra_mcp_servers=_hermes_mcp_servers_for_sdk(config) or None,
+            strict_mcp_config=surface["strict_mcp_config"],
+            setting_sources=surface["setting_sources"],
         )
 
     # NOTE: the user message is already added to messages by the standard

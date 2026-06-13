@@ -241,7 +241,15 @@ def apply(
         )
         msg_lines.append(
             "  (delegate_task, memory, session_search, todo run only on the "
-            "default Hermes runtime. They need the agent loop context.)"
+            "default Hermes runtime. They need the agent loop context. So Hermes "
+            "memory is not written while this runtime is on.)"
+        )
+        msg_lines.append(
+            "  By default the session does not load your personal Claude Code "
+            "MCP servers or skills, for a predictable surface. To inherit them, "
+            "set model.claude_runtime_inherit_user_config: true in config.yaml. "
+            "To add an MCP server (like Gmail) to every runtime, put it in "
+            "Hermes' own mcp_servers config instead."
         )
     else:
         restored_provider = model_cfg.get("provider", "?")

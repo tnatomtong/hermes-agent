@@ -249,6 +249,9 @@ class ClaudeAgentSession:
         system_prompt_append: Optional[str] = None,
         disallowed_tools: Optional[list[str]] = None,
         mcp_env_extra: Optional[dict[str, str]] = None,
+        extra_mcp_servers: Optional[dict[str, Any]] = None,
+        strict_mcp_config: Optional[bool] = None,
+        setting_sources: Optional[list[str]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -274,6 +277,17 @@ class ClaudeAgentSession:
         # Extra env for the hermes-tools MCP subprocess (gateway flag, session
         # origin). Built by the runtime glue, which has the session context.
         self._mcp_env_extra = mcp_env_extra
+        # More MCP servers to expose (Hermes' own configured servers). Merged
+        # with the built-in hermes-tools server.
+        self._extra_mcp_servers = extra_mcp_servers
+        # Controls how much of the user's personal Claude Code setup leaks in.
+        # strict_mcp_config=True means only the servers we pass are loaded, not
+        # the user's own ~/.claude MCP servers. setting_sources controls which
+        # settings (skills, project files) load. None on either leaves the SDK
+        # default (inherit user + project). The runtime glue sets these for a
+        # predictable surface; see agent/claude_runtime.py.
+        self._strict_mcp_config = strict_mcp_config
+        self._setting_sources = setting_sources
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -324,6 +338,11 @@ class ClaudeAgentSession:
             mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config(
                 self._mcp_env_extra
             )
+        if self._extra_mcp_servers:
+            # Do not let an extra server overwrite the built-in hermes-tools one.
+            for name, cfg in self._extra_mcp_servers.items():
+                if name != "hermes-tools":
+                    mcp_servers[name] = cfg
         opts: dict[str, Any] = dict(
             cwd=self._cwd,
             model=self._model,
@@ -333,6 +352,10 @@ class ClaudeAgentSession:
             cli_path=self._claude_bin,
             stderr=self._collect_stderr,
         )
+        if self._strict_mcp_config is not None:
+            opts["strict_mcp_config"] = self._strict_mcp_config
+        if self._setting_sources is not None:
+            opts["setting_sources"] = list(self._setting_sources)
         # Keep Claude Code's own system prompt (the preset) and add the Hermes
         # context on top. With no append we leave system_prompt unset so the
         # default is used as is.
