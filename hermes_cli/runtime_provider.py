@@ -248,6 +248,11 @@ _VALID_API_MODES = {
     # `model.openai_runtime == "codex_app_server"` AND provider in
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
+    # Optional opt-in: hand the entire turn to Claude Code via the
+    # claude-agent-sdk (user's own `claude` login, no API key). Gated behind
+    # config key `model.anthropic_runtime == "claude_agent"` AND provider
+    # "anthropic". Default is unchanged.
+    "claude_agent",
 }
 
 
@@ -1269,6 +1274,28 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
+
+    # Claude agent runtime short-circuit: when the user turned it on via
+    # `model.anthropic_runtime: claude_agent` (the /claude-runtime command),
+    # turns run through Claude Code under the user's own `claude` login. There
+    # are no Hermes-side credentials to resolve, so this must run before any
+    # pool or explicit-key resolution (which would fail with no Anthropic API
+    # key). This matches the codex_app_server opt-in, except that one uses the
+    # openai-codex pool entry because those credentials exist.
+    if requested_provider == "anthropic":
+        _model_cfg_early = _get_model_config()
+        _anthropic_runtime = str(
+            _model_cfg_early.get("anthropic_runtime") or ""
+        ).strip().lower()
+        if _anthropic_runtime == "claude_agent":
+            return {
+                "provider": "anthropic",
+                "api_mode": "claude_agent",
+                "base_url": "",
+                "api_key": "",
+                "source": "claude-agent-runtime",
+                "requested_provider": requested_provider,
+            }
 
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint
     # with provider="anthropic", bypass _resolve_named_custom_runtime (which would

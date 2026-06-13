@@ -758,6 +758,19 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
             )
     except Exception:
         pass
+    # Same indicator for the Claude Code runtime.
+    try:
+        from hermes_cli.claude_runtime_switch import (
+            get_current_runtime as _get_claude_runtime,
+        )
+        from hermes_cli.config import load_config as _load_cfg2
+        if _get_claude_runtime(_load_cfg2()) == "claude_agent":
+            right_lines.append(
+                f"[bold {accent}]Runtime:[/] [{text}]claude code[/] "
+                f"[dim {dim}](terminal/file ops/MCP run inside claude)[/]"
+            )
+    except Exception:
+        pass
     # Show active profile name when not 'default'
     try:
         from hermes_cli.profiles import get_active_profile_name

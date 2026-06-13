@@ -7048,6 +7048,45 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if result.success and result.requires_new_session:
             _cprint("    Tip: `/reset` starts a new session immediately.")
 
+    def _handle_claude_runtime(self, cmd_original: str) -> None:
+        """Handle /claude-runtime: turn the Claude Code runtime on or off.
+
+        Usage:
+            /claude-runtime                 show current state
+            /claude-runtime auto            Hermes default runtime
+            /claude-runtime claude_agent    hand turns to Claude Code
+            /claude-runtime on / off        synonyms for the above
+        """
+        from hermes_cli import claude_runtime_switch as crs
+
+        parts = cmd_original.split(None, 1)
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
+        new_value, errors = crs.parse_args(raw_args)
+        if errors:
+            for err in errors:
+                _cprint(f"❌ {err}")
+            return
+
+        try:
+            from hermes_cli.config import load_config, save_config
+        except Exception as exc:
+            _cprint(f"❌ could not load config: {exc}")
+            return
+        cfg = load_config()
+
+        result = crs.apply(
+            cfg,
+            new_value,
+            persist_callback=(save_config if new_value is not None else None),
+        )
+
+        prefix = "✓" if result.success else "✗"
+        for line in result.message.splitlines():
+            _cprint(f"  {prefix} {line}" if line.startswith("anthropic_runtime")
+                    else f"    {line}")
+        if result.success and result.requires_new_session:
+            _cprint("    Tip: `/reset` starts a new session immediately.")
+
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""
         if not text or has_images or not _looks_like_slash_command(text):
@@ -7375,6 +7414,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_model_switch(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
+        elif canonical == "claude-runtime":
+            self._handle_claude_runtime(cmd_original)
         elif canonical == "gquota":
             self._handle_gquota_command(cmd_original)
 
