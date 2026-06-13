@@ -28,15 +28,16 @@ logger = logging.getLogger(__name__)
 _CLAUDE_MODEL_ALIASES = {"sonnet", "opus", "haiku"}
 
 
-# Claude Code's own scheduling tools. They make Claude Code routines, which are
-# separate from Hermes cron. We turn them off so the model uses Hermes' cron
-# instead of silently creating a routine that does nothing for the user. This
-# is the bug we saw: asked about cron, the model reached for these.
+# Claude Code's own scheduling tools. They make Claude Code routines or wake-ups,
+# which are separate from Hermes cron. We turn them off so the model uses Hermes'
+# cron instead of silently scheduling something that does nothing for the user.
+# This is the bug we saw: asked about cron, the model reached for these.
 _DISALLOWED_CLAUDE_TOOLS = (
     "CronCreate",
     "CronDelete",
     "CronList",
     "RemoteTrigger",
+    "ScheduleWakeup",
 )
 
 
@@ -58,9 +59,13 @@ to list, add, or change scheduled jobs. Do not use your own Cron, Routine, \
 scheduled-task tools or scheduling skills (like /schedule): those make Claude \
 Code routines, which are separate from Hermes and will not do what the user \
 wants.
-- A few Hermes features (delegate_task, Hermes memory, session search) are not \
-available on this runtime. If the user asks for one, say so plainly instead of \
-guessing."""
+- Some Hermes features are not available on this runtime, because they need the \
+live Hermes process: delegate_task, Hermes memory, and session search. Hermes \
+memory is not written while you run here, so do not promise to save things to \
+Hermes memory. You also cannot send messages to other chats from here; your \
+final reply is delivered to the current chat automatically. If the user asks \
+for one of these, say plainly that it is not available on this runtime, instead \
+of guessing or using a Claude Code feature as a stand-in."""
 
 
 def _build_runtime_context(agent) -> str:
