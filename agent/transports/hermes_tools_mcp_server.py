@@ -109,18 +109,28 @@ def _signature_from_schema(schema: dict) -> Optional[inspect.Signature]:
     return inspect.Signature(req_params + opt_params)
 
 
-# Tools we expose. Each name MUST match a registered Hermes tool that
+# Tools we expose to an external runtime (codex_app_server or claude_agent).
+# Each name MUST match a registered Hermes tool that
 # `model_tools.handle_function_call()` can dispatch.
 #
-# What we deliberately DO NOT expose:
-#   - terminal / shell / read_file / write_file / patch / search_files /
-#     process — codex's built-ins cover these and approval routes through
-#     codex's own UI.
-#   - delegate_task / memory / session_search / todo — these are
-#     `_AGENT_LOOP_TOOLS` in Hermes (model_tools.py:493). They require
-#     the running AIAgent context to dispatch (mid-loop state), so a
-#     stateless MCP callback can't drive them. Hermes' default runtime
-#     keeps these working; the codex_app_server runtime cannot.
+# This is a curated allowlist on purpose. Whether a tool can be exposed needs a
+# judgment per tool, and one of the reasons (gateway-coupled) cannot be detected
+# automatically, so a "expose everything minus a denylist" approach would
+# silently expose tools that fail at call time. When adding a Hermes tool here,
+# check it is not in one of these three groups:
+#
+#   1. The runtime already does it natively. File and shell tools (terminal,
+#      read_file, write_file, patch, search_files, process, execute_code). Codex
+#      and Claude Code have their own, and approval routes through their own UI.
+#   2. Agent-loop tools that need the running AIAgent context: delegate_task,
+#      memory, session_search, todo (`_AGENT_LOOP_TOOLS` in model_tools.py). A
+#      stateless MCP subprocess cannot drive them. The default Hermes runtime
+#      keeps them working; external runtimes cannot.
+#   3. Gateway-coupled tools that need the live gateway process: send_message,
+#      discord, discord_admin. They call into the running gateway adapter
+#      (gateway.run._gateway_runner_ref), which is None in the MCP subprocess,
+#      so they would fail. The agent's final reply auto-delivers to the current
+#      chat, so send_message is not needed for the common case.
 EXPOSED_TOOLS: tuple[str, ...] = (
     "web_search",
     "web_extract",
@@ -135,9 +145,15 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "browser_console",
     "browser_vision",
     "vision_analyze",
+    "video_analyze",
     "image_generate",
+    "video_generate",
     "skill_view",
     "skills_list",
+    # skill_manage lets the agent create and edit Hermes skills (skill_view and
+    # skills_list are read-only). Not an agent-loop tool, so it works in the
+    # subprocess; it writes under HERMES_HOME/skills.
+    "skill_manage",
     "text_to_speech",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
