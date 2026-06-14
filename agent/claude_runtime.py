@@ -68,13 +68,54 @@ for one of these, say plainly that it is not available on this runtime, instead 
 of guessing or using a Claude Code feature as a stand-in."""
 
 
+def _memory_context_block(agent) -> str:
+    """Load Hermes memory (MEMORY.md + USER.md) and render it for the system
+    prompt, the same frozen-snapshot blocks the default runtime injects.
+
+    Without this the Claude session cannot see what Hermes already knows, so it
+    would answer blind and (once it can write memory) risk saving duplicates.
+    Reuses the store the agent already loaded at init, and falls back to building
+    one from config so the read-in still works if that store is absent.
+    """
+    store = getattr(agent, "_memory_store", None)
+    if store is None:
+        try:
+            from hermes_cli.config import load_config
+
+            mem_cfg = (load_config() or {}).get("memory") or {}
+            if mem_cfg.get("memory_enabled") or mem_cfg.get("user_profile_enabled"):
+                from tools.memory_tool import MemoryStore
+
+                store = MemoryStore(
+                    memory_char_limit=mem_cfg.get("memory_char_limit", 2200),
+                    user_char_limit=mem_cfg.get("user_char_limit", 1375),
+                )
+                store.load_from_disk()
+        except Exception:
+            logger.debug("could not load Hermes memory for read-in", exc_info=True)
+            store = None
+    if store is None:
+        return ""
+
+    blocks: list[str] = []
+    for target in ("user", "memory"):
+        try:
+            block = store.format_for_system_prompt(target)
+        except Exception:
+            block = None
+        if block:
+            blocks.append(block)
+    return "\n\n".join(blocks)
+
+
 def _build_runtime_context(agent) -> str:
     """Build the text added to Claude Code's system prompt so the session knows
     it is running as Hermes.
 
-    Reuses Hermes' own identity (SOUL.md or the default identity) and platform
-    hint so this stays in sync with Hermes. Only the runtime note is written
-    here, because it describes this runtime, which Hermes itself does not.
+    Reuses Hermes' own identity (SOUL.md or the default identity), Hermes memory,
+    and the platform hint so this stays in sync with Hermes. Only the runtime
+    note is written here, because it describes this runtime, which Hermes itself
+    does not.
     """
     parts: list[str] = []
 
@@ -107,7 +148,13 @@ def _build_runtime_context(agent) -> str:
         except Exception:
             pass
 
-    # 3. Runtime note. Written here because it is specific to this runtime.
+    # 3. Hermes memory (read side). Same frozen snapshot the default runtime
+    # shows the model, so the session knows what Hermes already remembers.
+    mem_block = _memory_context_block(agent)
+    if mem_block:
+        parts.append(mem_block)
+
+    # 4. Runtime note. Written here because it is specific to this runtime.
     parts.append(_RUNTIME_BRIDGE_NOTE)
 
     return "\n\n".join(p for p in parts if p)
