@@ -6,7 +6,7 @@ This is a new runtime for Hermes. When it is on, Hermes hands each turn to Claud
 Code (Anthropic's coding agent) instead of the usual model. It runs on your own
 `claude` login, so there is no extra API cost. You still talk to Hermes the same
 way (CLI or Discord), and you still have Hermes' tools (web, browser, cron,
-kanban, and so on). Claude is just the brain.
+memory, kanban, and so on). Claude is just the brain.
 
 We want to test it well before sending it upstream to the Hermes project. Please
 go through the list below and tick what works. Note anything that looks wrong.
@@ -75,9 +75,6 @@ go through the list below and tick what works. Note anything that looks wrong.
 - [ ] Kanban, if you use it: "show my kanban board." **[Both]**
 
 ### 6. Is it honest about its limits
-- [ ] "Can you remember this for next time?" It should say Hermes memory is not
-  written while this runtime is on. It should not promise to remember things in
-  Hermes memory. **[Both]**
 - [ ] "Send a message to my other Discord channel." It should say it cannot send
   to other chats from this runtime, only reply here. **[Discord]**
 - [ ] "Schedule a reminder for me in one hour." It should use Hermes cron, not its
@@ -98,11 +95,28 @@ go through the list below and tick what works. Note anything that looks wrong.
 - [ ] Tell it a fact ("my favorite color is green"), then in the next message ask
   "what is my favorite color?" It should remember within the same session. **[Both]**
 
-### 10. Cost and usage
+### 10. Hermes memory across sessions (new: it now reads and writes)
+This is the main new thing. On this runtime Claude can now read your saved Hermes
+memory and write to it, so facts last across sessions.
+- [ ] Ask "what do you already know about me?" It should read your saved Hermes
+  memory (if you have any). If you have none yet, that is fine. **[Both]**
+- [ ] Tell it something durable: "remember that I prefer short answers." It should
+  save it with the Hermes memory tool and can say it saved it. **[Both]**
+- [ ] Start a fresh session (`/new`, or a new thread in Discord), then ask "how do
+  I like my answers?" It should recall the saved fact. This is the real test: it
+  wrote to Hermes memory and read it back in a new session. **[Both]**
+- [ ] (Optional) Check the file yourself: the fact should show up in
+  `~/.hermes/memories/USER.md` or `~/.hermes/memories/MEMORY.md`. **[CLI]**
+- [ ] It should NOT save this into Claude Code's own memory or a `CLAUDE.md` file.
+  Hermes memory is the files above. **[Both]**
+- [ ] After a longer chat (about 10 turns), it may save useful facts on its own,
+  without being asked. That is the periodic memory check. Optional to verify. **[Both]**
+
+### 11. Cost and usage
 - [ ] Check `/usage` or `/status` after a few turns. Cost should show as included
   (your Claude subscription), not a surprising dollar charge. **[Both]**
 
-### 11. Settings surface (optional, for admins)
+### 12. Settings surface (optional, for admins)
 - [ ] By default, ask "do you have a Gmail tool, or a /schedule skill?" It should
   NOT have your personal Gmail/Calendar/Drive tools or your personal Claude Code
   skills. **[Both]**
@@ -114,8 +128,10 @@ go through the list below and tick what works. Note anything that looks wrong.
 
 ## Known limits (please do not report these as bugs)
 
-- Hermes memory, delegate_task, and session search do not run on this runtime.
-  Memory is not written while it is on.
+- Hermes memory now works here: it reads your saved memory and can write to it.
+  But delegate_task and session search still do not run on this runtime. There is
+  no separate automatic background memory review; the model saves durable facts as
+  it goes, or when the periodic memory check reminds it.
 - It cannot send messages to other chats from this runtime. Its reply goes to the
   current chat only.
 - During a turn there may be no live tool-by-tool progress; the full answer
