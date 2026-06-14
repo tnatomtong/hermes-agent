@@ -73,6 +73,21 @@ it is not available on this runtime, instead of guessing or using a Claude Code 
 feature as a stand-in."""
 
 
+# Appended to the turn prompt every _memory_nudge_interval turns (Hermes counts
+# the turns and sets should_review_memory). The default runtime spawns a
+# background review here, but that path needs an API-backed model, which a
+# subscription Claude login does not have. So instead we ask the model, which is
+# already running the turn, to review and save in band. Cheap: a few tokens, no
+# extra round trip. It is only added to the prompt sent to the model, not to the
+# stored transcript.
+_MEMORY_REVIEW_NUDGE = (
+    "[Memory check: if anything durable came up recently (a user preference, a "
+    "fact about their setup, a project convention), save or update it now with "
+    "the hermes-tools memory tool, merging against what is already saved. Skip "
+    "if nothing is worth keeping.]"
+)
+
+
 def _memory_context_block(agent) -> str:
     """Load Hermes memory (MEMORY.md + USER.md) and render it for the system
     prompt, the same frozen-snapshot blocks the default runtime injects.
@@ -453,8 +468,15 @@ def run_claude_agent_turn(
     # run_conversation() flow before the early return reaches us. Do not add it
     # again or it will be duplicated. (Same contract as codex_runtime.)
 
+    # Periodic memory review: when Hermes' turn counter says it is due, ask the
+    # model to save durable facts as part of this turn. Added to the prompt only,
+    # not to the stored messages.
+    turn_input = user_message
+    if should_review_memory:
+        turn_input = f"{user_message}\n\n{_MEMORY_REVIEW_NUDGE}"
+
     try:
-        turn = agent._claude_session.run_turn(user_input=user_message)
+        turn = agent._claude_session.run_turn(user_input=turn_input)
     except Exception as exc:
         logger.exception("claude agent turn failed")
         try:
@@ -530,7 +552,7 @@ def run_claude_agent_turn(
     # different transport). There is no API fallback for a subscription-only
     # Claude login, so the review triggers stay set for a later turn on a
     # default-runtime session instead of failing here.
-    _ = should_review_memory, should_review_skills
+    _ = should_review_skills
 
     return {
         "final_response": turn.final_text,
