@@ -87,8 +87,17 @@ class CLIAgentSetupMixin:
         # The OpenAI SDK accepts ``Callable[[], str]`` for ``api_key`` and
         # invokes it before every request. Skip the string-only validation
         # and placeholder substitution for callables.
+        # Self-contained runtimes bring their own auth and use no Hermes HTTP
+        # endpoint: claude_agent drives Claude Code on the user's own `claude`
+        # login, codex_app_server drives the Codex CLI. The resolver returns an
+        # empty api_key/base_url for them by design, so skip the credential
+        # checks below. The gateway path does the same (see gateway/run.py,
+        # which passes the empty values straight through).
+        _self_contained_runtime = resolved_api_mode in ("claude_agent", "codex_app_server")
+
         _is_callable_provider = callable(api_key) and not isinstance(api_key, str)
-        if not _is_callable_provider and (not isinstance(api_key, str) or not api_key):
+        if (not _self_contained_runtime and not _is_callable_provider
+                and (not isinstance(api_key, str) or not api_key)):
             # Custom / local endpoints (llama.cpp, ollama, vLLM, etc.) often
             # don't require authentication.  When a base_url IS configured but
             # no API key was found, use a placeholder so the OpenAI SDK
@@ -106,7 +115,7 @@ class CLIAgentSetupMixin:
                 print("\n⚠️  Provider resolver returned an empty API key. "
                       "Set OPENROUTER_API_KEY or run: hermes setup")
                 return False
-        if not isinstance(base_url, str) or not base_url:
+        if not _self_contained_runtime and (not isinstance(base_url, str) or not base_url):
             print("\n⚠️  Provider resolver returned an empty base URL. "
                   "Check your provider config or run: hermes setup")
             return False
