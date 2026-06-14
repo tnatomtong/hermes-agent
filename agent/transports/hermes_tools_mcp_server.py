@@ -29,13 +29,17 @@ What we DO NOT expose:
   - read_file / write_file / patch       — codex's apply_patch + shell
   - search_files / process               — codex's shell
   - clarify                              — codex's own UX
-  - delegate_task / memory /             — `_AGENT_LOOP_TOOLS` in Hermes
-    session_search / todo                  (model_tools.py). They require
+  - delegate_task / session_search /     — `_AGENT_LOOP_TOOLS` in Hermes
+    todo                                   (model_tools.py). They require
                                            the running AIAgent context to
                                            dispatch (mid-loop state), so a
                                            stateless MCP callback can't
                                            drive them. See the inline
                                            comment on EXPOSED_TOOLS below.
+                                           (memory is also an agent-loop tool,
+                                           but it is exposed through a special
+                                           handler because its store is
+                                           file-backed — see _make_memory_handler.)
 
 Run with: python -m agent.transports.hermes_tools_mcp_server
 Spawned by: CodexAppServerSession.ensure_started() when the runtime is
@@ -109,9 +113,106 @@ def _signature_from_schema(schema: dict) -> Optional[inspect.Signature]:
     return inspect.Signature(req_params + opt_params)
 
 
+# Minimal memory schema, used only if the running Hermes process did not
+# register the memory tool (so all_defs has no entry to copy from). The real
+# behavioural guidance lives in the tool description Hermes provides.
+_MEMORY_FALLBACK_SPEC: dict[str, Any] = {
+    "description": (
+        "Hermes persistent memory. action=add|replace|remove|read, "
+        "target=memory (your notes) or user (about the user)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string"},
+            "target": {"type": "string"},
+            "content": {"type": "string"},
+            "old_text": {"type": "string"},
+        },
+        "required": ["action"],
+    },
+}
+
+
+# One MemoryStore for the whole subprocess. Cached because the store's own
+# add/replace/remove re-read from disk under a file lock before each write, so a
+# single instance stays correct across calls and across other writers.
+_MEMORY_SUBPROCESS_STORE: Any = None
+
+
+def _memory_store_for_subprocess() -> Any:
+    """Build (once) a file-backed MemoryStore for MEMORY.md / USER.md under
+    HERMES_HOME/memories, using the char limits from Hermes config."""
+    global _MEMORY_SUBPROCESS_STORE
+    if _MEMORY_SUBPROCESS_STORE is None:
+        from tools.memory_tool import MemoryStore
+
+        mem_cfg: dict[str, Any] = {}
+        try:
+            from hermes_cli.config import load_config
+
+            mem_cfg = (load_config() or {}).get("memory") or {}
+        except Exception:
+            mem_cfg = {}
+        store = MemoryStore(
+            memory_char_limit=mem_cfg.get("memory_char_limit", 2200),
+            user_char_limit=mem_cfg.get("user_char_limit", 1375),
+        )
+        store.load_from_disk()
+        _MEMORY_SUBPROCESS_STORE = store
+    return _MEMORY_SUBPROCESS_STORE
+
+
+def _make_memory_handler(tool_schema: dict, description: str) -> Any:
+    """Special dispatch for the memory tool.
+
+    The generic dispatch (handle_function_call) refuses memory: it is an
+    agent-loop tool that normally needs the running AIAgent's MemoryStore. But
+    the store is not really tied to the loop. It is file-backed (MEMORY.md /
+    USER.md under HERMES_HOME/memories) with its own file lock and atomic
+    writes. So here we build the store straight from disk and call memory_tool
+    directly. The claude_agent runtime injects the same memory into the model's
+    prompt, so these writes are informed edits, not blind appends."""
+    def _dispatch(**kwargs: Any) -> str:
+        args = {k: v for k, v in (kwargs or {}).items() if v is not None}
+        action = str(args.get("action", "")).strip().lower()
+        target = str(args.get("target", "memory")).strip().lower() or "memory"
+        try:
+            store = _memory_store_for_subprocess()
+            if action == "read":
+                # memory_tool() only writes; reading just returns the current
+                # entries (the model also has them in its prompt).
+                store.load_from_disk()
+                entries = store.user_entries if target == "user" else store.memory_entries
+                return json.dumps(
+                    {"success": True, "target": target, "entries": entries},
+                    ensure_ascii=False,
+                )
+            from tools.memory_tool import memory_tool
+
+            return memory_tool(
+                action=action,
+                target=target,
+                content=args.get("content"),
+                old_text=args.get("old_text"),
+                store=store,
+            )
+        except Exception as exc:
+            logger.exception("memory tool raised")
+            return json.dumps({"error": str(exc), "tool": "memory"})
+
+    _dispatch.__name__ = "memory"
+    _dispatch.__doc__ = description
+    sig = _signature_from_schema(tool_schema)
+    if sig is not None:
+        _dispatch.__signature__ = sig
+    return _dispatch
+
+
 # Tools we expose to an external runtime (codex_app_server or claude_agent).
 # Each name MUST match a registered Hermes tool that
-# `model_tools.handle_function_call()` can dispatch.
+# `model_tools.handle_function_call()` can dispatch (memory is the one
+# exception — see _make_memory_handler).
 #
 # This is a curated allowlist on purpose. Whether a tool can be exposed needs a
 # judgment per tool, and one of the reasons (gateway-coupled) cannot be detected
@@ -181,6 +282,12 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     # claude_agent runtime sets that flag in its MCP env; the codex runtime
     # does not, so this is a no-op there until they opt in the same way.
     "cronjob",
+    # Hermes persistent memory (MEMORY.md / USER.md). Normally an agent-loop
+    # tool, but its store is file-backed, so we dispatch it through a special
+    # handler (_make_memory_handler) that writes straight to disk instead of
+    # the agent-loop path. The claude_agent runtime also reads this memory into
+    # the model's prompt, so the model edits against what it can already see.
+    "memory",
 )
 
 
@@ -224,6 +331,10 @@ def _build_server() -> Any:
 
     for name in EXPOSED_TOOLS:
         spec = all_defs.get(name)
+        if spec is None and name == "memory":
+            # Memory may not appear in get_tool_definitions on this runtime, but
+            # its store works standalone, so expose it from a fallback schema.
+            spec = _MEMORY_FALLBACK_SPEC
         if spec is None:
             logger.debug(
                 "skipping %s — not registered in this Hermes process", name
@@ -254,15 +365,15 @@ def _build_server() -> Any:
                 _dispatch.__signature__ = sig
             return _dispatch
 
+        if name == "memory":
+            handler = _make_memory_handler(params_schema, description)
+        else:
+            handler = _make_handler(name, params_schema)
+
         try:
-            mcp.add_tool(
-                _make_handler(name, params_schema),
-                name=name,
-                description=description,
-            )
+            mcp.add_tool(handler, name=name, description=description)
         except TypeError:
             # Older mcp SDK signature: fall back to decorator-style.
-            handler = _make_handler(name, params_schema)
             handler = mcp.tool(name=name, description=description)(handler)
 
         exposed_count += 1

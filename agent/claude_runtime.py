@@ -59,13 +59,18 @@ to list, add, or change scheduled jobs. Do not use your own Cron, Routine, \
 scheduled-task tools or scheduling skills (like /schedule): those make Claude \
 Code routines, which are separate from Hermes and will not do what the user \
 wants.
-- Some Hermes features are not available on this runtime, because they need the \
-live Hermes process: delegate_task, Hermes memory, and session search. Hermes \
-memory is not written while you run here, so do not promise to save things to \
-Hermes memory. You also cannot send messages to other chats from here; your \
-final reply is delivered to the current chat automatically. If the user asks \
-for one of these, say plainly that it is not available on this runtime, instead \
-of guessing or using a Claude Code feature as a stand-in."""
+- Hermes memory is available here, through the hermes-tools memory tool. The \
+memory shown above is what Hermes already knows. When you learn a durable fact \
+(a user preference, a detail about their setup, a project convention), save it \
+with that tool. Edit or merge against what is already there instead of adding \
+duplicates. Do not use Claude Code's own memory or CLAUDE.md files for this; \
+they are separate from Hermes memory.
+- Some Hermes features are still not available on this runtime, because they \
+need the live Hermes process: delegate_task and session search. You also cannot \
+send messages to other chats from here; your final reply is delivered to the \
+current chat automatically. If the user asks for one of these, say plainly that \
+it is not available on this runtime, instead of guessing or using a Claude Code \
+feature as a stand-in."""
 
 
 def _memory_context_block(agent) -> str:
