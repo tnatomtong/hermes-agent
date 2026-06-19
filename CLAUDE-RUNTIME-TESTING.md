@@ -90,6 +90,11 @@ go through the list below and tick what works. Note anything that looks wrong.
 ### 8. Stop a running task
 - [ ] Start a long task, e.g. "count slowly from 1 to 50 with a short pause each
   number," then send `/stop`. It should stop. **[Both]**
+  - In Discord, `/stop` interrupts the running turn.
+  - In the CLI, if the model put the task in the background (it will say "running
+    in background"), `/stop` retires the Claude session to stop that background
+    work, then the chat continues on your next message (it resumes from disk).
+    To interrupt a foreground turn in the CLI, press Enter/Esc.
 
 ### 9. Multi-turn memory within a session
 - [ ] Tell it a fact ("my favorite color is green"), then in the next message ask
