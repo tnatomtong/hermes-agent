@@ -94,6 +94,12 @@ go through the list below and tick what works. Note anything that looks wrong.
 ### 9. Multi-turn memory within a session
 - [ ] Tell it a fact ("my favorite color is green"), then in the next message ask
   "what is my favorite color?" It should remember within the same session. **[Both]**
+- [ ] Continuity across a restart: tell it a fact, restart the gateway
+  (`sudo systemctl restart hermes-gateway.service`), then in the same Discord
+  thread ask for the fact back. It should still remember and not say it is
+  starting fresh. The runtime resumes the saved Claude session from disk
+  (`~/.hermes/claude_runtime_sessions.json` maps each thread to its Claude
+  session id). **[Discord]**
 
 ### 10. Hermes memory across sessions (new: it now reads and writes)
 This is the main new thing. On this runtime Claude can now read your saved Hermes
