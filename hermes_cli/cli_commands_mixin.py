@@ -229,19 +229,55 @@ class CLICommandsMixin:
 
         Inspired by OpenAI Codex's separation of interrupt (stop current turn)
         from /stop (clean up background processes). See openai/codex#14602.
+
+        On the Claude runtime there is one more place work can hide: Claude Code
+        runs its own background jobs (run_in_background) inside its session, and
+        those are not in Hermes' process registry, so the kill_all() below cannot
+        see them. When Hermes has nothing to kill but a live Claude session
+        exists, retire that session. Closing it stops the model's background
+        work, and the conversation continues on the next message because the
+        runtime resumes it from disk.
         """
         from tools.process_registry import process_registry
+
+        agent = getattr(self, "agent", None)
+
+        # If a turn is actively running, interrupt it first. On the Claude
+        # runtime this reaches the live Claude turn too (AIAgent.interrupt
+        # forwards to the Claude session).
+        if agent is not None and getattr(self, "_agent_running", False):
+            try:
+                agent.interrupt("stop command")
+                print("  Interrupted the current turn.")
+            except Exception:
+                pass
 
         processes = process_registry.list_sessions()
         running = [p for p in processes if p.get("status") == "running"]
 
-        if not running:
-            print("  No running background processes.")
+        if running:
+            print(f"  Stopping {len(running)} background process(es)...")
+            killed = process_registry.kill_all()
+            print(f"  ✅ Stopped {killed} process(es).")
             return
 
-        print(f"  Stopping {len(running)} background process(es)...")
-        killed = process_registry.kill_all()
-        print(f"  ✅ Stopped {killed} process(es).")
+        # Nothing in Hermes' registry. On the Claude runtime, a background job
+        # the model started lives inside Claude Code's own session. Retire that
+        # session to stop it; the chat resumes from disk next message.
+        claude_session = getattr(agent, "_claude_session", None) if agent else None
+        if claude_session is not None:
+            try:
+                claude_session.close()
+                agent._claude_session = None
+                print(
+                    "  Stopped any background work in the Claude session. "
+                    "Your chat continues on the next message."
+                )
+            except Exception as exc:
+                print(f"  Could not stop the Claude session cleanly: {exc}")
+            return
+
+        print("  No running background processes.")
 
     def _handle_agents_command(self):
         """Handle /agents — show background processes and agent status."""
