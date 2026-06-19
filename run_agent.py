@@ -2301,6 +2301,20 @@ class AIAgent:
         """
         self._interrupt_requested = True
         self._interrupt_message = message
+        # Claude runtime: the whole turn is one blocking run_turn() on this
+        # thread driving Claude Code through the SDK. The tool-thread interrupt
+        # signals below never reach it, because the work runs inside Claude
+        # Code's own subprocess, not a Hermes tool thread. Tell the live Claude
+        # session to interrupt instead: its run_turn loop polls this flag and
+        # calls the SDK interrupt, which aborts the in-flight Claude turn and
+        # its running tool (for example a long bash command). No-op when there
+        # is no claude_agent session.
+        _claude_session = getattr(self, "_claude_session", None)
+        if _claude_session is not None:
+            try:
+                _claude_session.request_interrupt()
+            except Exception as exc:
+                logger.debug("Failed to forward interrupt to claude session: %s", exc)
         # Signal all tools to abort any in-flight operations immediately.
         # Scope the interrupt to this agent's execution thread so other
         # agents running in the same process (gateway) are not affected.
