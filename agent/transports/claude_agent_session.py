@@ -252,6 +252,7 @@ class ClaudeAgentSession:
         extra_mcp_servers: Optional[dict[str, Any]] = None,
         strict_mcp_config: Optional[bool] = None,
         setting_sources: Optional[list[str]] = None,
+        resume: Optional[str] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -288,6 +289,13 @@ class ClaudeAgentSession:
         # predictable surface; see agent/claude_runtime.py.
         self._strict_mcp_config = strict_mcp_config
         self._setting_sources = setting_sources
+        # Claude Code session id to continue. When set, the SDK reloads that
+        # session's transcript from disk so the conversation carries on across
+        # gateway restarts and agent-cache evictions. The runtime glue looks the
+        # id up per Hermes thread; see agent/claude_runtime.py. None starts a new
+        # Claude session. The transcript is keyed by cwd, so the glue only passes
+        # a resume id that was saved for this same cwd.
+        self._resume = resume
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -352,6 +360,14 @@ class ClaudeAgentSession:
             cli_path=self._claude_bin,
             stderr=self._collect_stderr,
         )
+        if self._resume:
+            # Continue the saved Claude Code session (reloads its transcript).
+            # fork_session is left at the SDK default (False) so it appends to
+            # the same session id instead of branching a new one each turn.
+            opts["resume"] = self._resume
+            # Report the resumed id right away, before the first message lands,
+            # so an early thread_id read is correct.
+            self._session_id = self._resume
         if self._strict_mcp_config is not None:
             opts["strict_mcp_config"] = self._strict_mcp_config
         if self._setting_sources is not None:

@@ -15,11 +15,101 @@ never sees or stores Anthropic credentials on this runtime.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# Where we remember which Claude Code session belongs to each Hermes thread.
+# Claude Code keeps the conversation inside its own session and writes the
+# transcript to disk; the SDK can reload it with resume=<id>. Hermes only needs
+# to remember the id per thread so a fresh agent (after a gateway restart or an
+# agent-cache eviction) continues the same conversation instead of starting
+# blank. Map shape: {hermes_session_id: {"claude_session_id", "cwd", "ts"}}.
+_RESUME_STORE_NAME = "claude_runtime_sessions.json"
+
+
+def _resume_store_path() -> Optional[str]:
+    try:
+        from hermes_constants import get_hermes_home
+        return str(get_hermes_home() / _RESUME_STORE_NAME)
+    except Exception:
+        logger.debug("could not resolve hermes home for resume store", exc_info=True)
+        return None
+
+
+def _load_resume_map() -> Dict[str, Any]:
+    path = _resume_store_path()
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.debug("could not read resume store %s", path, exc_info=True)
+        return {}
+
+
+def _lookup_resume_id(hermes_session_id: Optional[str], cwd: str) -> Optional[str]:
+    """Return the saved Claude session id for this Hermes thread, but only if it
+    was saved for the same cwd. The transcript is stored per project dir, so a
+    resume id from another cwd would not load."""
+    if not hermes_session_id:
+        return None
+    entry = _load_resume_map().get(hermes_session_id)
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("cwd") != cwd:
+        return None
+    sid = entry.get("claude_session_id")
+    return sid or None
+
+
+def _save_resume_id(
+    hermes_session_id: Optional[str], claude_session_id: Optional[str], cwd: str
+) -> None:
+    if not hermes_session_id or not claude_session_id:
+        return
+    path = _resume_store_path()
+    if not path:
+        return
+    try:
+        data = _load_resume_map()
+        data[hermes_session_id] = {
+            "claude_session_id": claude_session_id,
+            "cwd": cwd,
+            "ts": int(time.time()),
+        }
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    except Exception:
+        logger.debug("could not save resume id for %s", hermes_session_id, exc_info=True)
+
+
+def _forget_resume_id(hermes_session_id: Optional[str]) -> None:
+    """Drop a saved id, used when a resume failed (the transcript is gone)."""
+    if not hermes_session_id:
+        return
+    path = _resume_store_path()
+    if not path:
+        return
+    try:
+        data = _load_resume_map()
+        if hermes_session_id in data:
+            del data[hermes_session_id]
+            tmp = f"{path}.tmp.{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, path)
+    except Exception:
+        logger.debug("could not forget resume id for %s", hermes_session_id, exc_info=True)
 
 
 # Names the claude CLI accepts for --model. Anything else (for example a stale
@@ -415,6 +505,40 @@ def _record_claude_agent_usage(agent, turn) -> dict[str, Any]:
     }
 
 
+def _build_claude_session(agent, cwd: str, *, resume: Optional[str] = None):
+    """Build a ClaudeAgentSession for this agent. Factored out so the turn can
+    rebuild it without resume if a resume fails. resume continues a saved Claude
+    session (see the resume-store helpers above)."""
+    from agent.transports.claude_agent_session import ClaudeAgentSession
+
+    # Approval callback: use Hermes' standard prompt flow if a CLI thread set
+    # one. Gateway and cron contexts get the permission-mode default (see
+    # ClaudeAgentSession._can_use_tool).
+    try:
+        from tools.terminal_tool import _get_approval_callback
+        approval_callback = _get_approval_callback()
+    except Exception:
+        approval_callback = None
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+    except Exception:
+        config = {}
+    surface = _runtime_surface(config)
+    return ClaudeAgentSession(
+        cwd=cwd,
+        model=_claude_model_for(getattr(agent, "model", None)),
+        approval_callback=approval_callback,
+        system_prompt_append=_build_runtime_context(agent),
+        disallowed_tools=list(_DISALLOWED_CLAUDE_TOOLS),
+        mcp_env_extra=_build_mcp_env_extra(),
+        extra_mcp_servers=_hermes_mcp_servers_for_sdk(config) or None,
+        strict_mcp_config=surface["strict_mcp_config"],
+        setting_sources=surface["setting_sources"],
+        resume=resume,
+    )
+
+
 def run_claude_agent_turn(
     agent,
     *,
@@ -431,38 +555,20 @@ def run_claude_agent_turn(
     Called from run_conversation() when agent.api_mode == "claude_agent".
     Returns the same dict shape as the chat_completions path.
     """
-    from agent.transports.claude_agent_session import ClaudeAgentSession
-
     # Lazy session: one ClaudeAgentSession per AIAgent instance. Spawned on the
     # first turn, reused across turns (Claude Code keeps the conversation state
     # inside its own session), retired on a stuck process or auth failure.
+    #
+    # A fresh agent (after a gateway restart or an agent-cache eviction) has no
+    # live session, so we resume the Claude session saved for this Hermes thread.
+    # That reloads the transcript from disk and keeps the conversation going.
+    # resumed_id stays set only for a fresh resume, so the error path below can
+    # retry without it if the saved transcript is gone.
+    cwd = getattr(agent, "session_cwd", None) or os.getcwd()
+    resumed_id: Optional[str] = None
     if not hasattr(agent, "_claude_session") or agent._claude_session is None:
-        cwd = getattr(agent, "session_cwd", None) or os.getcwd()
-        # Approval callback: use Hermes' standard prompt flow if a CLI thread
-        # set one. Gateway and cron contexts get the permission-mode default
-        # (see ClaudeAgentSession._can_use_tool).
-        try:
-            from tools.terminal_tool import _get_approval_callback
-            approval_callback = _get_approval_callback()
-        except Exception:
-            approval_callback = None
-        try:
-            from hermes_cli.config import load_config
-            config = load_config()
-        except Exception:
-            config = {}
-        surface = _runtime_surface(config)
-        agent._claude_session = ClaudeAgentSession(
-            cwd=cwd,
-            model=_claude_model_for(getattr(agent, "model", None)),
-            approval_callback=approval_callback,
-            system_prompt_append=_build_runtime_context(agent),
-            disallowed_tools=list(_DISALLOWED_CLAUDE_TOOLS),
-            mcp_env_extra=_build_mcp_env_extra(),
-            extra_mcp_servers=_hermes_mcp_servers_for_sdk(config) or None,
-            strict_mcp_config=surface["strict_mcp_config"],
-            setting_sources=surface["setting_sources"],
-        )
+        resumed_id = _lookup_resume_id(getattr(agent, "session_id", None), cwd)
+        agent._claude_session = _build_claude_session(agent, cwd, resume=resumed_id)
 
     # NOTE: the user message is already added to messages by the standard
     # run_conversation() flow before the early return reaches us. Do not add it
@@ -484,17 +590,41 @@ def run_claude_agent_turn(
         except Exception:
             pass
         agent._claude_session = None
-        return {
-            "final_response": (
-                f"Claude agent turn failed: {exc}. "
-                f"Switch back to the default runtime with `/claude-runtime auto`."
-            ),
-            "messages": messages,
-            "api_calls": 0,
-            "completed": False,
-            "partial": True,
-            "error": str(exc),
-        }
+        # If this was a resume, the saved transcript may be gone (deleted, or on
+        # another machine). Forget the stale id and retry once with a fresh
+        # Claude session so the user still gets an answer this turn.
+        if resumed_id:
+            logger.warning(
+                "claude resume failed for session %s, retrying fresh",
+                getattr(agent, "session_id", None),
+            )
+            _forget_resume_id(getattr(agent, "session_id", None))
+            try:
+                agent._claude_session = _build_claude_session(agent, cwd, resume=None)
+                turn = agent._claude_session.run_turn(user_input=turn_input)
+            except Exception as exc2:
+                logger.exception("claude agent turn failed after resume retry")
+                try:
+                    agent._claude_session.close()
+                except Exception:
+                    pass
+                agent._claude_session = None
+                exc = exc2
+                turn = None
+        else:
+            turn = None
+        if turn is None:
+            return {
+                "final_response": (
+                    f"Claude agent turn failed: {exc}. "
+                    f"Switch back to the default runtime with `/claude-runtime auto`."
+                ),
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "partial": True,
+                "error": str(exc),
+            }
 
     # The turn says the subprocess is stuck or its login broke. Retire the
     # session so the next turn starts a fresh claude instead of reusing a
@@ -508,6 +638,16 @@ def run_claude_agent_turn(
         except Exception:
             pass
         agent._claude_session = None
+        # Do not resume a session we just retired as broken; forget its id.
+        _forget_resume_id(getattr(agent, "session_id", None))
+    else:
+        # Remember this Claude session id for this Hermes thread, so a fresh
+        # agent later (after a restart or cache eviction) continues it.
+        _save_resume_id(
+            getattr(agent, "session_id", None),
+            getattr(turn, "thread_id", None),
+            cwd,
+        )
 
     # Add the projected messages to the conversation. They are standard
     # {role, content, tool_calls, tool_call_id} entries for curator.py and the
