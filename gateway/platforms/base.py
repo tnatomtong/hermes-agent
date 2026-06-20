@@ -1453,6 +1453,10 @@ class MessageEvent:
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
 
+    # Per-channel working directory (e.g. Discord channel_cwds). When set, the
+    # turn runs with this as the agent's working directory.
+    channel_cwd: Optional[str] = None
+
     # Channel context recovered by history backfill (e.g. messages between
     # bot turns that were missed due to require_mention).  Kept separate
     # from ``text`` so the sender-prefix logic in run.py can operate on the
@@ -1716,6 +1720,43 @@ def resolve_channel_prompt(
         prompt = str(prompt).strip()
         if prompt:
             return prompt
+    return None
+
+
+def resolve_channel_cwd(
+    config_extra: dict,
+    channel_id: str,
+    parent_id: str | None = None,
+) -> str | None:
+    """Resolve a per-channel working directory from platform config.
+
+    Looks up ``channel_cwds`` in the adapter's ``config.extra`` dict. Prefers an
+    exact match on *channel_id*; falls back to *parent_id* (so a thread inherits
+    its parent channel's directory). Returns the expanded path, or None if there
+    is no match. A configured path that does not exist or is not a directory is
+    ignored (returns None) so a bad config falls back to the default, rather than
+    failing the turn.
+    """
+    cwds = config_extra.get("channel_cwds") or {}
+    if not isinstance(cwds, dict):
+        return None
+
+    for key in (channel_id, parent_id):
+        if not key:
+            continue
+        path = cwds.get(key)
+        if path is None:
+            continue
+        path = os.path.expanduser(str(path).strip())
+        if not path:
+            continue
+        if os.path.isdir(path):
+            return path
+        logger.warning(
+            "channel_cwds: configured path for %s is not a directory: %s",
+            key, path,
+        )
+        return None
     return None
 
 
