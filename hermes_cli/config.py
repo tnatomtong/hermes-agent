@@ -1918,6 +1918,7 @@ DEFAULT_CONFIG = {
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
+        "channel_cwds": {},            # Per-channel working directory: {channel_id: path} (forum parents apply to child threads)
         # Opt-in DM role-based auth (#12136). By default, DISCORD_ALLOWED_ROLES
         # authorizes only guild messages in the role's own guild — DMs require
         # DISCORD_ALLOWED_USERS. Set dm_role_auth_guild to a guild ID to also
