@@ -8565,6 +8565,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                channel_cwd=event.channel_cwd,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -13051,6 +13052,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        channel_cwd: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -14070,6 +14072,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _cache[session_key] = (agent, _sig)
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
+
+            # Per-channel working directory: when the channel pins one, the turn
+            # runs there. session_cwd is the per-session working directory the
+            # runtime uses (the Claude runtime reads it; harmless on others). Set
+            # it every turn so a cached agent picks up the channel's directory.
+            if channel_cwd:
+                agent.session_cwd = channel_cwd
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
@@ -15412,6 +15421,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    channel_cwd=channel_cwd,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
